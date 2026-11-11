@@ -3417,6 +3417,10 @@ int vrend_create_vertex_elements_state(struct vrend_context *ctx,
       if (desc->channel[0].normalized)
          v->elements[i].norm = GL_TRUE;
       v->elements[i].nr_chan = desc->nr_channels;
+      if (util_format_is_pure_uint(elements[i].src_format))
+         v->unsigned_int_bitmask |= 1 << i;
+      else if (util_format_is_pure_sint(elements[i].src_format))
+         v->signed_int_bitmask |= 1 << i;
 
       if (desc->nr_channels == 4 && desc->swizzle[0] == PIPE_SWIZZLE_Z)
          v->zyxw_bitmask |= 1 << i;
@@ -3463,12 +3467,8 @@ void vrend_bind_vertex_elements_state(struct vrend_context *ctx,
          struct vrend_vertex_element *ve = &v->elements[i];
          GLint size = !vrend_state.use_gles && (v->zyxw_bitmask & (1 << i)) ? GL_BGRA : ve->nr_chan;
 
-         if (util_format_is_pure_integer(ve->base.src_format)) {
-            UPDATE_INT_SIGN_MASK(ve->base.src_format, i,
-                                 v->signed_int_bitmask,
-                                 v->unsigned_int_bitmask);
+         if (util_format_is_pure_integer(ve->base.src_format))
             glVertexAttribIFormat(i, size, ve->type, ve->base.src_offset);
-         }
          else
             glVertexAttribFormat(i, size, ve->type, ve->norm, ve->base.src_offset);
          glVertexAttribBinding(i, ve->base.vertex_buffer_index);
@@ -4266,9 +4266,10 @@ static inline void vrend_fill_shader_key(struct vrend_sub_context *sub_ctx,
 
       /* Only use integer info when drawing to avoid stale info.
        * Since we can get here from link_shaders before actually drawing anything,
-       * we may have no vertex element array */
-      if (vrend_state.use_integer && sub_ctx->drawing && sub_ctx->ve &&
-          type == PIPE_SHADER_VERTEX) {
+       * we may have no vertex element array. OpenGL ES leaves an integer
+       * attribute that feeds a float input undefined, so type them there. */
+      if ((vrend_state.use_integer || vrend_state.use_gles) &&
+          sub_ctx->drawing && sub_ctx->ve && type == PIPE_SHADER_VERTEX) {
          key->vs.attrib_signed_int_bitmask = sub_ctx->ve->signed_int_bitmask;
          key->vs.attrib_unsigned_int_bitmask = sub_ctx->ve->unsigned_int_bitmask;
       }

@@ -604,6 +604,177 @@ START_TEST(virgl_test_render_simple)
 }
 END_TEST
 
+/* Draws a triangle over a 4 by 4 target in the color a fragment shader takes
+ * from an integer vertex attribute in buffer 1: unsigned / 255, or
+ * (signed + 128) / 255. Returns the texel at (1, 1). */
+static uint32_t draw_integer_attribute(enum pipe_format format, bool is_signed,
+                                       unsigned stride, unsigned offset,
+                                       const void *data, unsigned size)
+{
+   static const float positions[3][4] = {
+      { -1.0f, -1.0f, 0.0f, 1.0f },
+      {  3.0f, -1.0f, 0.0f, 1.0f },
+      { -1.0f,  3.0f, 0.0f, 1.0f },
+   };
+   static const char *vs_text =
+      "VERT\n"
+      "DCL IN[0]\n"
+      "DCL IN[1]\n"
+      "DCL OUT[0], POSITION\n"
+      "DCL OUT[1], GENERIC[0]\n"
+      "  0: MOV OUT[0], IN[0]\n"
+      "  1: MOV OUT[1], IN[1]\n"
+      "  2: END\n";
+   static const char *fs_unsigned_text =
+      "FRAG\n"
+      "DCL IN[0], GENERIC[0], CONSTANT\n"
+      "DCL OUT[0], COLOR\n"
+      "DCL TEMP[0]\n"
+      "IMM[0] FLT32 { 0.00392157, 128.0, 0.0, 0.0 }\n"
+      "  0: U2F TEMP[0], IN[0]\n"
+      "  1: MUL OUT[0], TEMP[0], IMM[0].xxxx\n"
+      "  2: END\n";
+   static const char *fs_signed_text =
+      "FRAG\n"
+      "DCL IN[0], GENERIC[0], CONSTANT\n"
+      "DCL OUT[0], COLOR\n"
+      "DCL TEMP[0]\n"
+      "IMM[0] FLT32 { 0.00392157, 128.0, 0.0, 0.0 }\n"
+      "  0: I2F TEMP[0], IN[0]\n"
+      "  1: ADD TEMP[0], TEMP[0], IMM[0].yyyy\n"
+      "  2: MUL OUT[0], TEMP[0], IMM[0].xxxx\n"
+      "  3: END\n";
+   struct virgl_context ctx;
+   struct virgl_resource res, vbo, ibo;
+   struct pipe_vertex_element ve[2];
+   struct pipe_vertex_buffer vbuf[2];
+   struct pipe_shader_state shader;
+   struct pipe_blend_state blend;
+   struct pipe_depth_stencil_alpha_state dsa;
+   struct pipe_rasterizer_state rasterizer;
+   struct pipe_viewport_state vp;
+   struct pipe_draw_info info;
+   struct pipe_box box = { .height = 1, .depth = 1 };
+   struct virgl_box read_box = { .w = 4, .h = 4, .d = 1 };
+   union pipe_color_union color = { .f = { 0.0f, 0.0f, 0.0f, 1.0f } };
+   uint32_t handles[PIPE_SHADER_TYPES] = { 0 };
+   uint32_t texel;
+   int ret;
+
+   ret = testvirgl_init_ctx_cmdbuf(&ctx, context_flags);
+   ck_assert_int_eq(ret, 0);
+   ret = testvirgl_create_backed_simple_2d_res(&res, 1, 4, 4);
+   ck_assert_int_eq(ret, 0);
+   ret = testvirgl_create_backed_simple_buffer(&vbo, 2, sizeof(positions), PIPE_BIND_VERTEX_BUFFER);
+   ck_assert_int_eq(ret, 0);
+   ret = testvirgl_create_backed_simple_buffer(&ibo, 3, size, PIPE_BIND_VERTEX_BUFFER);
+   ck_assert_int_eq(ret, 0);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, res.handle);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, vbo.handle);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, ibo.handle);
+
+   clear_res(&ctx, &res, 1, &color);
+
+   box.width = sizeof(positions);
+   virgl_encoder_inline_write(&ctx, &vbo, 0, 0, &box, positions, box.width, 0);
+   box.width = size;
+   virgl_encoder_inline_write(&ctx, &ibo, 0, 0, &box, data, box.width, 0);
+
+   memset(ve, 0, sizeof(ve));
+   ve[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   ve[1].src_offset = offset;
+   ve[1].vertex_buffer_index = 1;
+   ve[1].src_format = format;
+   virgl_encoder_create_vertex_elements(&ctx, 2, 2, ve);
+   virgl_encode_bind_object(&ctx, 2, VIRGL_OBJECT_VERTEX_ELEMENTS);
+
+   memset(vbuf, 0, sizeof(vbuf));
+   vbuf[0].stride = sizeof(positions[0]);
+   vbuf[0].buffer = &vbo.base;
+   vbuf[1].stride = stride;
+   vbuf[1].buffer = &ibo.base;
+   virgl_encoder_set_vertex_buffers(&ctx, 2, vbuf);
+
+   memset(&shader, 0, sizeof(shader));
+   virgl_encode_shader_state(&ctx, 3, PIPE_SHADER_VERTEX, &shader, vs_text);
+   virgl_encode_shader_state(&ctx, 4, PIPE_SHADER_FRAGMENT, &shader,
+                             is_signed ? fs_signed_text : fs_unsigned_text);
+   virgl_encode_bind_shader(&ctx, 3, PIPE_SHADER_VERTEX);
+   virgl_encode_bind_shader(&ctx, 4, PIPE_SHADER_FRAGMENT);
+   handles[PIPE_SHADER_VERTEX] = 3;
+   handles[PIPE_SHADER_FRAGMENT] = 4;
+   virgl_encode_link_shader(&ctx, handles);
+
+   memset(&blend, 0, sizeof(blend));
+   blend.rt[0].colormask = PIPE_MASK_RGBA;
+   virgl_encode_blend_state(&ctx, 5, &blend);
+   virgl_encode_bind_object(&ctx, 5, VIRGL_OBJECT_BLEND);
+   memset(&dsa, 0, sizeof(dsa));
+   virgl_encode_dsa_state(&ctx, 6, &dsa);
+   virgl_encode_bind_object(&ctx, 6, VIRGL_OBJECT_DSA);
+   memset(&rasterizer, 0, sizeof(rasterizer));
+   rasterizer.cull_face = PIPE_FACE_NONE;
+   rasterizer.half_pixel_center = 1;
+   rasterizer.bottom_edge_rule = 1;
+   rasterizer.depth_clip = 1;
+   virgl_encode_rasterizer_state(&ctx, 7, &rasterizer);
+   virgl_encode_bind_object(&ctx, 7, VIRGL_OBJECT_RASTERIZER);
+
+   vp.scale[0] = vp.scale[1] = 2.0f;
+   vp.scale[2] = 0.5f;
+   vp.translate[0] = vp.translate[1] = 2.0f;
+   vp.translate[2] = 0.5f;
+   virgl_encoder_set_viewport_states(&ctx, 0, 1, &vp);
+
+   memset(&info, 0, sizeof(info));
+   info.count = 3;
+   info.mode = PIPE_PRIM_TRIANGLES;
+   virgl_encoder_draw_vbo(&ctx, &info);
+   ret = testvirgl_ctx_send_cmdbuf(&ctx);
+   ck_assert_int_eq(ret, 0);
+
+   ret = virgl_renderer_transfer_read_iov(res.handle, ctx.ctx_id, 0, 0, 0, &read_box, 0, NULL, 0);
+   ck_assert_int_eq(ret, 0);
+   texel = ((uint32_t *)res.iovs[0].iov_base)[4 + 1];
+
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, ibo.handle);
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, vbo.handle);
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, res.handle);
+   testvirgl_destroy_backed_res(&ibo);
+   testvirgl_destroy_backed_res(&vbo);
+   testvirgl_destroy_backed_res(&res);
+   testvirgl_fini_ctx_cmdbuf(&ctx);
+   return texel;
+}
+
+/* B8G8R8X8 channels within one of the 8-bit values drawn as red, green and blue. */
+static void check_texel_rgb(uint32_t texel, int r, int g, int b)
+{
+   ck_assert_int_le(abs((int)((texel >> 16) & 0xff) - r), 1);
+   ck_assert_int_le(abs((int)((texel >> 8) & 0xff) - g), 1);
+   ck_assert_int_le(abs((int)(texel & 0xff) - b), 1);
+}
+
+/* An integer attribute feeds an integer shader input, which OpenGL ES
+ * requires: a float input leaves the draw undefined there. */
+START_TEST(virgl_test_render_integer_attribute)
+{
+   static const uint8_t unsigned_values[3][4] = {
+      { 64, 128, 192, 255 }, { 64, 128, 192, 255 }, { 64, 128, 192, 255 },
+   };
+   static const int16_t signed_values[3][4] = {
+      { -64, -1, 0, 127 }, { -64, -1, 0, 127 }, { -64, -1, 0, 127 },
+   };
+
+   check_texel_rgb(draw_integer_attribute(PIPE_FORMAT_R8G8B8A8_UINT, false, 4, 0,
+                                          unsigned_values, sizeof(unsigned_values)),
+                   64, 128, 192);
+   check_texel_rgb(draw_integer_attribute(PIPE_FORMAT_R16G16B16A16_SINT, true, 8, 0,
+                                          signed_values, sizeof(signed_values)),
+                   64, 127, 128);
+}
+END_TEST
+
 static void virgl_test_bind_images_shader(int first_layer, int last_layer, int expected_error)
 {
     struct virgl_context ctx;
@@ -2095,6 +2266,7 @@ static Suite *virgl_init_suite(void)
   tcase_add_test(tc_core, virgl_test_overlap_obj_id);
   tcase_add_test(tc_core, virgl_test_large_shader);
   tcase_add_test(tc_core, virgl_test_render_simple);
+  tcase_add_test(tc_core, virgl_test_render_integer_attribute);
   tcase_add_test(tc_core, virgl_test_render_geom_simple);
   tcase_add_test(tc_core, virgl_test_render_xfb);
   tcase_add_test(tc_core, virgl_test_set_viewport_state);
