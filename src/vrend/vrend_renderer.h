@@ -505,6 +505,15 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
                                      bool enable_storage,
                                      bool query_samples);
 
+/* The core entry points, or on an OpenGL ES 3.0 host those of
+ * GL_ANGLE_texture_multisample, which libepoxy does not know. */
+struct vrend_multisample_funcs {
+   PFNGLTEXSTORAGE2DMULTISAMPLEPROC tex_storage_2d;
+   PFNGLGETMULTISAMPLEFVPROC get_multisamplefv;
+   PFNGLSAMPLEMASKIPROC sample_maski;
+};
+extern struct vrend_multisample_funcs vrend_multisample;
+
 struct vrend_resource *vrend_renderer_ctx_res_lookup(struct vrend_context *ctx,
                                                      int res_handle);
 

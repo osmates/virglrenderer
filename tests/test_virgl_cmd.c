@@ -348,6 +348,66 @@ START_TEST(virgl_test_blit_shader)
 }
 END_TEST
 
+static bool host_has_multisample_textures(void)
+{
+   uint32_t max_ver, max_size;
+   struct virgl_caps_v1 *caps;
+   bool has;
+
+   /* capability set 1, VIRGL */
+   virgl_renderer_get_cap_set(1, &max_ver, &max_size);
+   caps = calloc(1, max_size);
+   virgl_renderer_fill_caps(1, max_ver, caps);
+   has = caps->bset.texture_multisample;
+   free(caps);
+   return has;
+}
+
+/* A 4-sample target cleared and resolved, in its format and through the
+ * blitter's shaders into one without alpha. On an OpenGL ES 3.0 host this
+ * takes GL_ANGLE_texture_multisample. */
+START_TEST(virgl_test_multisample_resolve)
+{
+   struct virgl_context ctx;
+   struct virgl_resource ms, resolved, converted;
+   union pipe_color_union color = { .f = { 0.0f, 1.0f, 0.0f, 1.0f } };
+   int ret;
+
+   ret = testvirgl_init_ctx_cmdbuf(&ctx, context_flags);
+   ck_assert_int_eq(ret, 0);
+   if (!host_has_multisample_textures()) {
+      testvirgl_fini_ctx_cmdbuf(&ctx);
+      return;
+   }
+
+   ret = create_backed_2d_res(&ms, 1, PIPE_FORMAT_B8G8R8A8_UNORM, 16, 16, 4);
+   ck_assert_int_eq(ret, 0);
+   ret = create_backed_2d_res(&resolved, 2, PIPE_FORMAT_B8G8R8A8_UNORM, 16, 16, 0);
+   ck_assert_int_eq(ret, 0);
+   ret = create_backed_2d_res(&converted, 3, PIPE_FORMAT_B8G8R8X8_UNORM, 16, 16, 0);
+   ck_assert_int_eq(ret, 0);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, ms.handle);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, resolved.handle);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, converted.handle);
+
+   clear_res(&ctx, &ms, 1, &color);
+   blit_res(&ctx, &resolved, &ms, 16, 16);
+   blit_res(&ctx, &converted, &ms, 16, 16);
+   ret = testvirgl_ctx_send_cmdbuf(&ctx);
+   ck_assert_int_eq(ret, 0);
+   check_res_rgb(&ctx, &resolved, 16, 16, test_green);
+   check_res_rgb(&ctx, &converted, 16, 16, test_green);
+
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, converted.handle);
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, resolved.handle);
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, ms.handle);
+   testvirgl_destroy_backed_res(&converted);
+   testvirgl_destroy_backed_res(&resolved);
+   testvirgl_destroy_backed_res(&ms);
+   testvirgl_fini_ctx_cmdbuf(&ctx);
+}
+END_TEST
+
 struct vertex {
    float position[4];
    float color[4];
@@ -2281,6 +2341,7 @@ static Suite *virgl_init_suite(void)
   tcase_add_test(tc_core, virgl_test_clear);
   tcase_add_test(tc_core, virgl_test_blit_simple);
   tcase_add_test(tc_core, virgl_test_blit_shader);
+  tcase_add_test(tc_core, virgl_test_multisample_resolve);
   tcase_add_test(tc_core, virgl_test_overlap_obj_id);
   tcase_add_test(tc_core, virgl_test_large_shader);
   tcase_add_test(tc_core, virgl_test_render_simple);

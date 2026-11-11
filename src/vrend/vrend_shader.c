@@ -6255,7 +6255,11 @@ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *g
          emit_ext(glsl_strbufs, "EXT_clip_cull_distance", "require");
       }
 
-      if (ctx->shader_req_bits & SHADER_REQ_SAMPLER_MS)
+      /* An ES 3.0 host has multisample textures only through
+       * GL_ANGLE_texture_multisample. */
+      if ((ctx->shader_req_bits & SHADER_REQ_SAMPLER_MS) && ctx->cfg->glsl_version < 310)
+         emit_ext(glsl_strbufs, "ANGLE_texture_multisample", "require");
+      else if (ctx->shader_req_bits & SHADER_REQ_SAMPLER_MS)
          emit_ext(glsl_strbufs, "OES_texture_storage_multisample_2d_array", "require");
 
       if (ctx->shader_req_bits & SHADER_REQ_CONSERVATIVE_DEPTH)

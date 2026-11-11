@@ -406,6 +406,7 @@ struct global_renderer_state {
 #endif
    bool d3d_share_texture : 1;
    bool gbm_layout_feat : 1;
+   bool angle_texture_multisample : 1;
 };
 
 struct sysval_uniform_block {
@@ -1258,6 +1259,40 @@ static void init_features(int gl_ver, int gles_ver)
          }
       }
    }
+}
+
+struct vrend_multisample_funcs vrend_multisample;
+
+static void init_multisample_funcs(int gles_ver)
+{
+   vrend_multisample.tex_storage_2d = glTexStorage2DMultisample;
+   vrend_multisample.get_multisamplefv = glGetMultisamplefv;
+   vrend_multisample.sample_maski = glSampleMaski;
+   vrend_state.angle_texture_multisample = false;
+
+#ifdef HAVE_EPOXY_EGL_H
+   /* An OpenGL ES 3.0 host such as ANGLE on Metal has multisample textures
+    * only through GL_ANGLE_texture_multisample, which has no 2D arrays. */
+   if (gles_ver != 30 || !epoxy_has_gl_extension("GL_ANGLE_texture_multisample"))
+      return;
+
+   struct vrend_multisample_funcs angle = {
+      .tex_storage_2d = (PFNGLTEXSTORAGE2DMULTISAMPLEPROC)
+         eglGetProcAddress("glTexStorage2DMultisampleANGLE"),
+      .get_multisamplefv = (PFNGLGETMULTISAMPLEFVPROC)
+         eglGetProcAddress("glGetMultisamplefvANGLE"),
+      .sample_maski = (PFNGLSAMPLEMASKIPROC)
+         eglGetProcAddress("glSampleMaskiANGLE"),
+   };
+   if (!angle.tex_storage_2d || !angle.get_multisamplefv || !angle.sample_maski)
+      return;
+
+   vrend_multisample = angle;
+   vrend_state.angle_texture_multisample = true;
+   set_feature(feat_texture_multisample);
+   set_feature(feat_storage_multisample);
+   set_feature(feat_sample_mask);
+#endif
 }
 
 static void vrend_destroy_surface(struct vrend_surface *surf)
@@ -7727,6 +7762,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    if (!vrend_winsys_has_gl_colorspace())
       clear_feature(feat_srgb_write_control) ;
 
+   init_multisample_funcs(gles ? gl_ver : 0);
+
    glGetIntegerv(GL_MAX_DRAW_BUFFERS, (GLint *) &vrend_state.max_draw_buffers);
 
    /* For testing we need to know maximum */
@@ -8154,6 +8191,10 @@ static int check_resource_valid(const struct vrend_renderer_resource_create_args
 
       if (args->target != PIPE_TEXTURE_2D && args->target != PIPE_TEXTURE_2D_ARRAY) {
          snprintf(errmsg, 256, "Multisample textures not 2D (target:%d)", args->target);
+         return -1;
+      }
+      if (args->target == PIPE_TEXTURE_2D_ARRAY && vrend_state.angle_texture_multisample) {
+         snprintf(errmsg, 256, "Multisample 2D array textures not supported");
          return -1;
       }
       /* The host's GL refuses a larger count without vrend noticing. */
@@ -8831,9 +8872,9 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
       if (pr->nr_samples > 1) {
          if (format_can_texture_storage) {
             if (gr->target == GL_TEXTURE_2D_MULTISAMPLE) {
-               glTexStorage2DMultisample(gr->target, pr->nr_samples,
-                                         internalformat, pr->width0, pr->height0,
-                                         GL_TRUE);
+               vrend_multisample.tex_storage_2d(gr->target, pr->nr_samples,
+                                                internalformat, pr->width0, pr->height0,
+                                                GL_TRUE);
             } else {
                glTexStorage3DMultisample(gr->target, pr->nr_samples,
                                          internalformat, pr->width0, pr->height0, pr->array_size,
@@ -10421,7 +10462,7 @@ void vrend_set_clip_state(struct vrend_context *ctx, struct pipe_clip_state *ucp
 void vrend_set_sample_mask(UNUSED struct vrend_context *ctx, unsigned sample_mask)
 {
    if (has_feature(feat_sample_mask))
-      glSampleMaski(0, sample_mask);
+      vrend_multisample.sample_maski(0, sample_mask);
 }
 
 void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples)

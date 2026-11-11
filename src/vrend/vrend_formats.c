@@ -661,8 +661,8 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
          glGenTextures(1, &tex_id);
          glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex_id);
          if (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) {
-            glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
-                                      table[i].internalformat, 32, 32, GL_TRUE);
+            vrend_multisample.tex_storage_2d(GL_TEXTURE_2D_MULTISAMPLE, 2,
+                                             table[i].internalformat, 32, 32, GL_TRUE);
          } else {
             glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
                                     table[i].internalformat, 32, 32, GL_TRUE);
@@ -732,7 +732,7 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
          continue;
       glGenTextures(1, &tex);
       glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex);
-      glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, test_num_samples[i], GL_RGBA32F, 64, 64, GL_TRUE);
+      vrend_multisample.tex_storage_2d(GL_TEXTURE_2D_MULTISAMPLE, test_num_samples[i], GL_RGBA32F, 64, 64, GL_TRUE);
       status = glGetError();
       if (status == GL_NO_ERROR) {
          glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -745,7 +745,7 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
             for (unsigned k = 0; k < test_num_samples[i]; ++k) {
                float msp[2];
                uint32_t compressed;
-               glGetMultisamplefv(GL_SAMPLE_POSITION, k, msp);
+               vrend_multisample.get_multisamplefv(GL_SAMPLE_POSITION, k, msp);
                compressed = ((unsigned)(floor(msp[0] * 16.0f)) & 0xf) << 4;
                compressed |= ((unsigned)(floor(msp[1] * 16.0f)) & 0xf);
                caps->sample_locations[out_buf_offsets[i] + (k >> 2)] |= compressed  << (8 * (k & 3));
