@@ -1612,6 +1612,64 @@ START_TEST(virgl_decode_bind_sampler_states)
 }
 END_TEST
 
+static bool host_is_gles(void)
+{
+   uint32_t max_ver, max_size;
+   struct virgl_caps_v2 *caps;
+   bool is_gles;
+
+   /* capability set 2, VIRGL2 */
+   virgl_renderer_get_cap_set(2, &max_ver, &max_size);
+   caps = calloc(1, max_size);
+   virgl_renderer_fill_caps(2, max_ver, caps);
+   is_gles = caps->capability_bits & VIRGL_CAP_HOST_IS_GLES;
+   free(caps);
+   return is_gles;
+}
+
+/* A sampler state of each wrap mode leaves its context working. Guests use
+ * CLAMP_TO_BORDER on any host, which GLES has from 3.2 or with
+ * texture_border_clamp, and the mirror clamp modes where the host has them;
+ * a GLES host takes the closest mode it has for each of them. */
+START_TEST(virgl_test_sampler_state_wrap_modes)
+{
+   uint32_t nop = VIRGL_CMD0(VIRGL_CCMD_NOP, 0, 0);
+   struct virgl_context ctx;
+   unsigned last;
+   int ret;
+
+   ret = testvirgl_init_ctx_cmdbuf(&ctx, context_flags);
+   ck_assert_int_eq(ret, 0);
+   ret = virgl_renderer_context_create(2, strlen("test2"), "test2");
+   ck_assert_int_eq(ret, 0);
+   last = host_is_gles() ? PIPE_TEX_WRAP_MIRROR_CLAMP_TO_BORDER : PIPE_TEX_WRAP_MIRROR_REPEAT;
+
+   for (unsigned wrap = PIPE_TEX_WRAP_REPEAT; wrap <= last; wrap++) {
+      struct pipe_sampler_state state;
+      uint32_t handle = wrap + 1;
+
+      memset(&state, 0, sizeof(state));
+      state.wrap_s = state.wrap_t = state.wrap_r = wrap;
+      state.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+      state.max_lod = 1000.0f;
+      state.border_color.f[3] = 1.0f;
+      virgl_encode_sampler_state(&ctx, handle, &state);
+      ret = testvirgl_ctx_send_cmdbuf(&ctx);
+      ck_assert_int_eq(ret, 0);
+
+      /* vrend looks at a context's error as it switches to the context. */
+      ret = virgl_renderer_submit_cmd(&nop, 2, 1);
+      ck_assert_int_eq(ret, 0);
+      virgl_encode_bind_sampler_states(&ctx, PIPE_SHADER_FRAGMENT, 0, 1, &handle);
+      ret = testvirgl_ctx_send_cmdbuf(&ctx);
+      ck_assert_int_eq(ret, 0);
+   }
+
+   virgl_renderer_context_destroy(2);
+   testvirgl_fini_ctx_cmdbuf(&ctx);
+}
+END_TEST
+
 START_TEST(virgl_test_encode_sampler_view)
 {
    struct virgl_context ctx;
@@ -2353,6 +2411,7 @@ static Suite *virgl_init_suite(void)
   tcase_add_test(tc_core, virgl_decode_set_scissor_state);
   tcase_add_test(tc_core, virgl_decode_set_constant_buffer);
   tcase_add_test(tc_core, virgl_decode_bind_sampler_states);
+  tcase_add_test(tc_core, virgl_test_sampler_state_wrap_modes);
   tcase_add_test(tc_core, virgl_test_encode_sampler_view);
   tcase_add_test(tc_core, virgl_test_encode_sampler_view_fail_layers);
   tcase_add_test(tc_core, virgl_test_encode_sampler_view_texture_buffer);

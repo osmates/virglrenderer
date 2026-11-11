@@ -1279,6 +1279,7 @@ static void __report_core_warn(const char *fname, struct vrend_context *ctx,
 #define GLES_WARN_LOGIC_OP 15
 #define GLES_WARN_TIMESTAMP 16
 #define GLES_WARN_IMPLICIT_MSAA_SURFACE 17
+#define GLES_WARN_TEXTURE_WRAP 18
 
 ASSERTED
 static const char *vrend_gles_warn_strings[] = {
@@ -1298,6 +1299,7 @@ static const char *vrend_gles_warn_strings[] = {
    [GLES_WARN_LOGIC_OP]              = "LogicOp",
    [GLES_WARN_TIMESTAMP]             = "GL_TIMESTAMP",
    [GLES_WARN_IMPLICIT_MSAA_SURFACE] = "Implicit MSAA Surface",
+   [GLES_WARN_TEXTURE_WRAP]          = "Texture Wrap",
 };
 
 static void __report_gles_warn(ASSERTED const char *fname,
@@ -2655,6 +2657,17 @@ static void vrend_destroy_dsa_object(void *obj_ptr)
    FREE(state);
 }
 
+/* GLES has no mirror clamp mode but the one of
+ * GL_EXT_texture_mirror_clamp_to_edge, which mirrors once as the others do;
+ * without it, mirrored repeat is the closest. */
+static GLuint convert_wrap_gles_mirror_clamp(struct vrend_context *ctx)
+{
+   report_gles_warn(ctx, GLES_WARN_TEXTURE_WRAP);
+   if (has_feature(feat_texture_mirror_clamp_to_edge))
+      return GL_MIRROR_CLAMP_TO_EDGE_EXT;
+   return GL_MIRRORED_REPEAT;
+}
+
 static GLuint convert_wrap(struct vrend_context *ctx, int wrap)
 {
    switch(wrap){
@@ -2662,12 +2675,21 @@ static GLuint convert_wrap(struct vrend_context *ctx, int wrap)
    case PIPE_TEX_WRAP_CLAMP: if (vrend_state.use_core_profile == false) return GL_CLAMP; else return GL_CLAMP_TO_EDGE;
 
    case PIPE_TEX_WRAP_CLAMP_TO_EDGE: return GL_CLAMP_TO_EDGE;
-   case PIPE_TEX_WRAP_CLAMP_TO_BORDER: return GL_CLAMP_TO_BORDER;
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
+      /* GLES has it from 3.2 or with the extensions that also bring the
+       * sampler border colors. */
+      if (vrend_state.use_gles && !has_feature(feat_sampler_border_colors)) {
+         report_gles_warn(ctx, GLES_WARN_TEXTURE_WRAP);
+         return GL_CLAMP_TO_EDGE;
+      }
+      return GL_CLAMP_TO_BORDER;
 
    case PIPE_TEX_WRAP_MIRROR_REPEAT: return GL_MIRRORED_REPEAT;
    case PIPE_TEX_WRAP_MIRROR_CLAMP:
       if (has_feature(feat_texture_mirror_clamp))
          return GL_MIRROR_CLAMP_EXT;
+      else if (vrend_state.use_gles)
+         return convert_wrap_gles_mirror_clamp(ctx);
       else {
           vrend_report_context_error(ctx, VIRGL_ERROR_CTX_UNSUPPORTED_TEX_WRAP, wrap);
           return GL_MIRRORED_REPEAT;
@@ -2675,6 +2697,8 @@ static GLuint convert_wrap(struct vrend_context *ctx, int wrap)
    case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE:
       if (has_feature(feat_texture_mirror_clamp_to_edge))
          return GL_MIRROR_CLAMP_TO_EDGE_EXT;
+      else if (vrend_state.use_gles)
+         return convert_wrap_gles_mirror_clamp(ctx);
       else {
          vrend_report_context_error(ctx, VIRGL_ERROR_CTX_UNSUPPORTED_TEX_WRAP, wrap);
          return GL_MIRRORED_REPEAT;
@@ -2682,6 +2706,8 @@ static GLuint convert_wrap(struct vrend_context *ctx, int wrap)
    case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_BORDER:
       if (has_feature(feat_texture_mirror_clamp_to_border)) {
          return GL_MIRROR_CLAMP_TO_BORDER_EXT;
+      } else if (vrend_state.use_gles) {
+         return convert_wrap_gles_mirror_clamp(ctx);
       } else {
          vrend_report_context_error(ctx, VIRGL_ERROR_CTX_UNSUPPORTED_TEX_WRAP, wrap);
          return GL_MIRRORED_REPEAT;
