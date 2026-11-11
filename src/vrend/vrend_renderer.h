@@ -312,10 +312,10 @@ int vrend_create_so_target(struct vrend_context *ctx,
                            uint32_t buffer_offset,
                            uint32_t buffer_size);
 
-void vrend_set_streamout_targets(struct vrend_context *ctx,
-                                 uint32_t append_bitmask,
-                                 uint32_t num_targets,
-                                 uint32_t *handles);
+int vrend_set_streamout_targets(struct vrend_context *ctx,
+                                uint32_t append_bitmask,
+                                uint32_t num_targets,
+                                uint32_t *handles);
 
 int vrend_create_vertex_elements_state(struct vrend_context *ctx,
                                        uint32_t handle,
@@ -454,6 +454,9 @@ void vrend_set_tess_state(struct vrend_context *ctx, const float tess_factors[6]
 
 void vrend_renderer_fini(void);
 
+struct virgl_renderer_limits;
+void vrend_renderer_set_limits(const struct virgl_renderer_limits *limits);
+
 void vrend_renderer_set_fence_retire(struct vrend_context *ctx,
                                      vrend_context_fence_retire retire,
                                      void *retire_data);
@@ -579,7 +582,7 @@ void vrend_renderer_resource_get_info(struct pipe_resource *pres,
 void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
                                 uint32_t *max_size);
 
-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
+int vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 void vrend_renderer_destroy_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 void vrend_renderer_set_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 

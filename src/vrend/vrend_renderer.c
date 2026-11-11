@@ -347,6 +347,13 @@ static const  struct {
    FEAT(vs_viewport_index, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_viewport_index"),
 };
 
+/* What the guest's contexts make vrend hold, counted against the limits. */
+struct vrend_usage {
+   uint32_t sub_contexts;
+   uint32_t objects;
+   uint64_t shader_bytes;
+};
+
 struct global_renderer_state {
    struct vrend_context *ctx0;
    struct vrend_context *current_ctx;
@@ -388,6 +395,12 @@ struct global_renderer_state {
    uint32_t inferred_gl_caching_type;
 
    uint64_t features[feat_last / 64 + 1];
+
+   struct vrend_usage held;
+   struct vrend_usage context_limit;
+   struct vrend_usage total_limit;
+   uint32_t shader_text_limit;
+   uint32_t shader_token_limit;
 
    bool finishing : 1;
    bool use_gles : 1;
@@ -520,6 +533,8 @@ struct vrend_shader_selector {
    struct tgsi_token *tokens;
 
    uint32_t req_local_mem;
+   /* the TGSI text the guest declared, counted against the limits */
+   uint32_t text_bytes;
 };
 
 struct vrend_long_shader_buffer {
@@ -810,6 +825,7 @@ struct vrend_sub_context {
    int prim_mode;
    bool drawing;
    struct vrend_context *parent;
+   struct vrend_usage held;
    struct sysval_uniform_block sysvalue_data;
    uint32_t sysvalue_data_cookie;
    uint32_t current_program_id;
@@ -840,6 +856,8 @@ struct vrend_context {
    bool ctx_switch_pending;
 
    enum virgl_ctx_errors last_error;
+
+   struct vrend_usage held;
 
    /* resource bounds to this context */
    struct util_hash_table *res_hash;
@@ -1124,6 +1142,7 @@ static const char *vrend_ctx_error_strings[] = {
    [VIRGL_ERROR_CTX_BLIT_AREA_OUT_OF_RANGE] = "Blit z-slices out of range;",
    [VIRGL_ERROR_CTX_SSBO_BINDING_RANGE] = "SSBO binding out of range for resource",
    [VIRGL_ERROR_CTX_RESOURCE_OUT_OF_RANGE] = "Resource copy out of range for resource",
+   [VIRGL_ERROR_CTX_LIMIT_EXCEEDED] = "Limit of what a context holds exceeded",
 };
 
 void vrend_report_context_error_internal(const char *fname, struct vrend_context *ctx,
@@ -1134,6 +1153,87 @@ void vrend_report_context_error_internal(const char *fname, struct vrend_context
    virgl_error("%s: context error reported %d \"%s\" %s %d\n", fname,
                ctx->ctx_id, ctx->debug_name, vrend_ctx_error_strings[error],
                value);
+}
+
+static bool vrend_usage_fits(const struct vrend_usage *held,
+                             const struct vrend_usage *usage,
+                             const struct vrend_usage *limit)
+{
+   return (!usage->sub_contexts || !limit->sub_contexts ||
+           (uint64_t)held->sub_contexts + usage->sub_contexts <= limit->sub_contexts) &&
+          (!usage->objects || !limit->objects ||
+           (uint64_t)held->objects + usage->objects <= limit->objects) &&
+          (!usage->shader_bytes || !limit->shader_bytes ||
+           held->shader_bytes + usage->shader_bytes <= limit->shader_bytes);
+}
+
+static void vrend_usage_add(struct vrend_usage *held, const struct vrend_usage *usage)
+{
+   held->sub_contexts += usage->sub_contexts;
+   held->objects += usage->objects;
+   held->shader_bytes += usage->shader_bytes;
+}
+
+static void vrend_usage_subtract(struct vrend_usage *held, const struct vrend_usage *usage)
+{
+   held->sub_contexts -= usage->sub_contexts;
+   held->objects -= usage->objects;
+   held->shader_bytes -= usage->shader_bytes;
+}
+
+/* Whether a context may hold this much more; if not, the context fails. The
+ * renderer's own context is not the guest's and has no limits. */
+static bool vrend_check_usage(struct vrend_context *ctx, const struct vrend_usage *usage)
+{
+   if (!ctx->ctx_id)
+      return true;
+
+   if (vrend_usage_fits(&ctx->held, usage, &vrend_state.context_limit) &&
+       vrend_usage_fits(&vrend_state.held, usage, &vrend_state.total_limit))
+      return true;
+
+   vrend_report_context_error(ctx, VIRGL_ERROR_CTX_LIMIT_EXCEEDED, ctx->ctx_id);
+   return false;
+}
+
+/* Whether one shader's text or tokens stay within their limit; if not, the
+ * context fails. */
+static bool vrend_check_shader_size(struct vrend_context *ctx, uint64_t size, uint32_t limit)
+{
+   if (!ctx->ctx_id || !limit || size <= limit)
+      return true;
+
+   vrend_report_context_error(ctx, VIRGL_ERROR_CTX_LIMIT_EXCEEDED, ctx->ctx_id);
+   return false;
+}
+
+static void vrend_charge(struct vrend_sub_context *sub, const struct vrend_usage *usage)
+{
+   if (!sub->parent->ctx_id)
+      return;
+
+   vrend_usage_add(&sub->held, usage);
+   vrend_usage_add(&sub->parent->held, usage);
+   vrend_usage_add(&vrend_state.held, usage);
+}
+
+static bool vrend_hold(struct vrend_sub_context *sub, const struct vrend_usage *usage)
+{
+   if (!vrend_check_usage(sub->parent, usage))
+      return false;
+
+   vrend_charge(sub, usage);
+   return true;
+}
+
+static void vrend_release(struct vrend_sub_context *sub, const struct vrend_usage *usage)
+{
+   if (!sub->parent->ctx_id)
+      return;
+
+   vrend_usage_subtract(&sub->held, usage);
+   vrend_usage_subtract(&sub->parent->held, usage);
+   vrend_usage_subtract(&vrend_state.held, usage);
 }
 
 #define CORE_PROFILE_WARN_NONE 0
@@ -1401,8 +1501,11 @@ vrend_shader_state_reference(struct vrend_shader_selector **ptr, struct vrend_sh
    *ptr = shader;
 }
 
-static void vrend_destroy_long_shader_buffer(struct vrend_long_shader_buffer *lsbuf)
+static void vrend_destroy_long_shader_buffer(struct vrend_sub_context *sub,
+                                             struct vrend_long_shader_buffer *lsbuf)
 {
+   if (lsbuf->tmp_buf)
+      vrend_release(sub, &(struct vrend_usage){ .shader_bytes = lsbuf->total_length });
    vrend_shader_state_reference(&lsbuf->sel, NULL);
    free(lsbuf->tmp_buf);
    free(lsbuf);
@@ -2326,9 +2429,11 @@ static void vrend_free_programs(struct vrend_sub_context *sub)
    }
 }
 
-static void vrend_destroy_streamout_object(struct vrend_streamout_object *obj)
+static void vrend_destroy_streamout_object(struct vrend_sub_context *sub,
+                                           struct vrend_streamout_object *obj)
 {
    unsigned i;
+   vrend_release(sub, &(struct vrend_usage){ .objects = 1 });
    list_del(&obj->head);
    for (i = 0; i < obj->num_targets; i++)
       vrend_so_target_reference(&obj->so_targets[i], NULL);
@@ -2485,7 +2590,7 @@ static void vrend_destroy_so_target_object(void *obj_ptr)
                if (sub_ctx->current_so && has_feature(feat_transform_feedback2))
                   glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, sub_ctx->current_so->id);
             }
-            vrend_destroy_streamout_object(obj);
+            vrend_destroy_streamout_object(sub_ctx, obj);
             break;
          }
       }
@@ -4489,30 +4594,34 @@ static int vrend_shader_assign_tgsi(struct vrend_context *ctx,
                                     uint32_t num_tokens)
 {
    struct tgsi_token *tokens;
+   /* the tokens the text is parsed into count while they exist */
+   const struct vrend_usage parse = {
+      .shader_bytes = ((uint64_t)num_tokens + 10) * sizeof(struct tgsi_token)
+   };
+   int ret = 0;
 
    /* check for null termination */
    if (current_length < 4 || !memchr(shader_buf + current_length - 4, '\0', 4))
       return EINVAL;
 
-   tokens = calloc(num_tokens + 10, sizeof(struct tgsi_token));
-   if (!tokens)
+   if (!vrend_check_shader_size(ctx, num_tokens, vrend_state.shader_token_limit) ||
+       !vrend_hold(ctx->sub, &parse))
       return ENOMEM;
 
-   if (!tgsi_text_translate(shader_buf, tokens, num_tokens + 10)) {
-      free(tokens);
-      return EINVAL;
-   }
-
-   if (vrend_finish_shader(ctx, sel, tokens)) {
-      free(tokens);
-      return EINVAL;
-   }
+   tokens = calloc(num_tokens + 10, sizeof(struct tgsi_token));
+   if (!tokens)
+      ret = ENOMEM;
+   else if (!tgsi_text_translate(shader_buf, tokens, num_tokens + 10) ||
+            vrend_finish_shader(ctx, sel, tokens))
+      ret = EINVAL;
 
    free(tokens);
-   return 0;
+   vrend_release(ctx->sub, &parse);
+   return ret;
 }
 
-static int vrend_shader_store_long_shader(uint32_t handle,
+static int vrend_shader_store_long_shader(struct vrend_sub_context *sub,
+                                          uint32_t handle,
                                           struct vrend_shader_selector *sel,
                                           uint32_t pkt_length_bytes,
                                           uint32_t expected_token_count,
@@ -4528,9 +4637,15 @@ static int vrend_shader_store_long_shader(uint32_t handle,
    vrend_shader_state_reference(&lsbuf->sel, sel);
    lsbuf->current_length = pkt_length_bytes;
    lsbuf->total_length = expected_token_count * 4;
+   struct vrend_usage usage = { .shader_bytes = lsbuf->total_length };
+   if (!vrend_hold(sub, &usage)) {
+      vrend_destroy_long_shader_buffer(sub, lsbuf);
+      return ENOMEM;
+   }
    lsbuf->tmp_buf = malloc(lsbuf->total_length);
    if (!lsbuf->tmp_buf) {
-      vrend_destroy_long_shader_buffer(lsbuf);
+      vrend_release(sub, &usage);
+      vrend_destroy_long_shader_buffer(sub, lsbuf);
       return ENOMEM;
    }
 
@@ -4602,12 +4717,17 @@ int vrend_create_shader(struct vrend_context *ctx,
         return EINVAL;
       }
 
+      if (!vrend_check_shader_size(ctx, (uint64_t)expected_token_count * 4,
+                                   vrend_state.shader_text_limit))
+         return ENOMEM;
+
       struct vrend_shader_selector *sel;
       sel = vrend_create_shader_state(so_info, req_local_mem, type);
       if (sel == NULL) {
          virgl_error("Unable to allocate shader state\n");
          return ENOMEM;
       }
+      sel->text_bytes = expected_token_count * 4;
 
       int ret_handle = vrend_renderer_object_insert(ctx, sel, handle, VIRGL_OBJECT_SHADER);
       if (ret_handle == 0) {
@@ -4617,7 +4737,7 @@ int vrend_create_shader(struct vrend_context *ctx,
 
       if (expected_token_count > pkt_length) {
          /* We only got a partial shader, start a long shader transfer */
-         int ret = vrend_shader_store_long_shader(handle, sel,
+         int ret = vrend_shader_store_long_shader(sub_ctx, handle, sel,
                                                   pkt_length_bytes, expected_token_count,
                                                   shd_text,
                                                   &sub_ctx->long_shader_in_progress[type]);
@@ -4649,7 +4769,7 @@ int vrend_create_shader(struct vrend_context *ctx,
          virgl_error("Got mismatched shader continuation %u vs %u\n",
                  offlen, lsbuf->current_length);
          sub_ctx->long_shader_in_progress[type] = NULL;
-         vrend_destroy_long_shader_buffer(lsbuf);
+         vrend_destroy_long_shader_buffer(sub_ctx, lsbuf);
          vrend_renderer_object_destroy(ctx, handle);
          return EINVAL;
       }
@@ -4658,7 +4778,7 @@ int vrend_create_shader(struct vrend_context *ctx,
          virgl_error("Got too large shader continuation %u vs %u\n",
                       pkt_length_bytes + lsbuf->current_length, lsbuf->total_length);
          sub_ctx->long_shader_in_progress[type] = NULL;
-         vrend_destroy_long_shader_buffer(lsbuf);
+         vrend_destroy_long_shader_buffer(sub_ctx, lsbuf);
          vrend_renderer_object_destroy(ctx, handle);
          return EINVAL;
       }
@@ -4670,7 +4790,7 @@ int vrend_create_shader(struct vrend_context *ctx,
                                             lsbuf->tmp_buf, lsbuf->current_length,
                                             num_tokens);
          sub_ctx->long_shader_in_progress[type] = NULL;
-         vrend_destroy_long_shader_buffer(lsbuf);
+         vrend_destroy_long_shader_buffer(sub_ctx, lsbuf);
          if (ret != 0) {
             virgl_error("Error assigning TGSI\n");
             vrend_renderer_object_destroy(ctx, handle);
@@ -7908,7 +8028,28 @@ vrend_renderer_fini(void)
    vrend_state.current_ctx = NULL;
    vrend_state.current_hw_ctx = NULL;
 
+   memset(&vrend_state.context_limit, 0, sizeof(vrend_state.context_limit));
+   memset(&vrend_state.total_limit, 0, sizeof(vrend_state.total_limit));
+   vrend_state.shader_text_limit = 0;
+   vrend_state.shader_token_limit = 0;
+
    vrend_state.finishing = false;
+}
+
+void vrend_renderer_set_limits(const struct virgl_renderer_limits *limits)
+{
+   vrend_state.context_limit = (struct vrend_usage) {
+      .sub_contexts = limits->context_sub_contexts,
+      .objects = limits->context_objects,
+      .shader_bytes = limits->context_shader_bytes,
+   };
+   vrend_state.total_limit = (struct vrend_usage) {
+      .sub_contexts = limits->total_sub_contexts,
+      .objects = limits->total_objects,
+      .shader_bytes = limits->total_shader_bytes,
+   };
+   vrend_state.shader_text_limit = limits->shader_text_bytes;
+   vrend_state.shader_token_limit = limits->shader_tokens;
 }
 
 static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
@@ -7976,7 +8117,7 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
       glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
 
    list_for_each_entry_safe(struct vrend_streamout_object, obj, &sub->streamout_list, head)
-      vrend_destroy_streamout_object(obj);
+      vrend_destroy_streamout_object(sub, obj);
 
    vrend_shader_state_reference(&sub->shaders[PIPE_SHADER_VERTEX], NULL);
    vrend_shader_state_reference(&sub->shaders[PIPE_SHADER_FRAGMENT], NULL);
@@ -8005,7 +8146,7 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
       }
 
       if (sub->long_shader_in_progress[type])
-         vrend_destroy_long_shader_buffer(sub->long_shader_in_progress[type]);
+         vrend_destroy_long_shader_buffer(sub, sub->long_shader_in_progress[type]);
    }
 
    if (sub->zsurf)
@@ -8021,6 +8162,9 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
    vrend_resource_reference((struct vrend_resource **)&sub->ib.buffer, NULL);
 
    vrend_object_fini_ctx_table(sub->object_hash);
+   /* its objects, gone without a context to release them from, and itself */
+   struct vrend_usage held = sub->held;
+   vrend_release(sub, &held);
    vrend_clicbs->destroy_gl_context(sub->gl_context);
 
    list_del(&sub->head);
@@ -8111,6 +8255,12 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
    VREND_DEBUG(dbg_caller, grctx, "create context\n");
 
    grctx->ctx_id = id;
+
+   /* sub-context 0, made below */
+   if (!vrend_check_usage(grctx, &(struct vrend_usage){ .sub_contexts = 1 })) {
+      FREE(grctx);
+      return NULL;
+   }
 
    list_inithead(&grctx->sub_ctxs);
    list_inithead(&grctx->vrend_resources);
@@ -10503,16 +10653,17 @@ static void vrend_hw_emit_streamout_targets(UNUSED struct vrend_context *ctx, st
    }
 }
 
-void vrend_set_streamout_targets(struct vrend_context *ctx,
-                                 UNUSED uint32_t append_bitmask,
-                                 uint32_t num_targets,
-                                 uint32_t *handles)
+int vrend_set_streamout_targets(struct vrend_context *ctx,
+                                UNUSED uint32_t append_bitmask,
+                                uint32_t num_targets,
+                                uint32_t *handles)
 {
+   const struct vrend_usage usage = { .objects = 1 };
    struct vrend_so_target *target;
    unsigned i;
 
    if (!has_feature(feat_transform_feedback))
-      return;
+      return 0;
 
    if (num_targets) {
       list_for_each_entry(struct vrend_streamout_object, obj, &ctx->sub->streamout_list, head) {
@@ -10520,11 +10671,14 @@ void vrend_set_streamout_targets(struct vrend_context *ctx,
             if (!memcmp(handles, obj->handles, num_targets * 4)) {
                ctx->sub->current_so = obj;
                glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, obj->id);
-               return;
+               return 0;
             }
          }
       }
 
+      /* each new set of targets gets an object, kept until a target goes */
+      if (!vrend_hold(ctx->sub, &usage))
+         return ENOMEM;
       struct vrend_streamout_object *obj = CALLOC_STRUCT(vrend_streamout_object);
       if (has_feature(feat_transform_feedback2)) {
          glGenTransformFeedbacks(1, &obj->id);
@@ -10542,7 +10696,8 @@ void vrend_set_streamout_targets(struct vrend_context *ctx,
                vrend_so_target_reference(&obj->so_targets[j], NULL);
             vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_HANDLE, handles[i]);
             free(obj);
-            return;
+            vrend_release(ctx->sub, &usage);
+            return 0;
          }
          vrend_so_target_reference(&obj->so_targets[i], target);
       }
@@ -10555,6 +10710,7 @@ void vrend_set_streamout_targets(struct vrend_context *ctx,
          glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
       ctx->sub->current_so = NULL;
    }
+   return 0;
 }
 
 static void vrend_resource_buffer_copy(UNUSED struct vrend_context *ctx,
@@ -11800,16 +11956,55 @@ static void vrend_finish_context_switch(struct vrend_context *ctx)
    vrend_clicbs->make_current(ctx->sub->gl_context);
 }
 
+/* What the object of a handle holds; nothing when there is none. */
+static struct vrend_usage vrend_object_usage(struct vrend_sub_context *sub, uint32_t handle)
+{
+   struct vrend_usage usage = { 0 };
+   struct vrend_shader_selector *sel;
+
+   if (!vrend_object_exists(sub->object_hash, handle))
+      return usage;
+
+   usage.objects = 1;
+   sel = vrend_object_lookup(sub->object_hash, handle, VIRGL_OBJECT_SHADER);
+   if (sel)
+      usage.shader_bytes = sel->text_bytes;
+   return usage;
+}
+
 void
 vrend_renderer_object_destroy(struct vrend_context *ctx, uint32_t handle)
 {
+   const struct vrend_usage usage = vrend_object_usage(ctx->sub, handle);
+
    vrend_object_remove(ctx->sub->object_hash, handle, 0);
+   vrend_release(ctx->sub, &usage);
 }
 
 uint32_t vrend_renderer_object_insert(struct vrend_context *ctx, void *data,
                                       uint32_t handle, enum virgl_object_type type)
 {
-   return vrend_object_insert(ctx->sub->object_hash, data, handle, type);
+   struct vrend_sub_context *sub = ctx->sub;
+   /* an object of the same handle is replaced */
+   const struct vrend_usage old = vrend_object_usage(sub, handle);
+   struct vrend_usage usage = { .objects = 1 };
+   uint32_t ret;
+
+   if (type == VIRGL_OBJECT_SHADER)
+      usage.shader_bytes = ((struct vrend_shader_selector *)data)->text_bytes;
+
+   vrend_release(sub, &old);
+   if (!vrend_hold(sub, &usage)) {
+      vrend_charge(sub, &old);
+      return 0;
+   }
+
+   ret = vrend_object_insert(sub->object_hash, data, handle, type);
+   if (!ret) {
+      vrend_release(sub, &usage);
+      vrend_charge(sub, &old);
+   }
+   return ret;
 }
 
 static uint32_t query_stats_index_to_gl_map[] = {
@@ -13467,20 +13662,24 @@ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
    }
 }
 
-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+int vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
 {
+   const struct vrend_usage usage = { .sub_contexts = 1 };
    struct virgl_gl_ctx_param ctx_params;
    GLuint i;
 
    list_for_each_entry(struct vrend_sub_context, sub, &ctx->sub_ctxs, head) {
       if (sub->sub_ctx_id == sub_ctx_id) {
-         return;
+         return 0;
       }
    }
 
+   if (!vrend_check_usage(ctx, &usage))
+      return ENOMEM;
+
    struct vrend_sub_context *sub = CALLOC_STRUCT(vrend_sub_context);
    if (!sub)
-      return;
+      return ENOMEM;
 
    ctx_params.shared = (ctx->ctx_id == 0 && sub_ctx_id == 0) ? false : true;
    ctx_params.major_ver = vrend_state.gl_major_ver;
@@ -13533,6 +13732,8 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
       ctx->sub0 = sub;
 
    vrend_set_tweak_from_env(&ctx->sub->tweaks);
+   vrend_charge(sub, &usage);
+   return 0;
 }
 
 unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx, enum virgl_debug_flags flag)

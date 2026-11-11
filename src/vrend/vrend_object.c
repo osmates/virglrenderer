@@ -129,6 +129,11 @@ void *vrend_object_lookup(struct util_hash_table *handle_hash,
    return obj->data;
 }
 
+bool vrend_object_exists(struct util_hash_table *handle_hash, uint32_t handle)
+{
+   return util_hash_table_get(handle_hash, intptr_to_pointer(handle)) != NULL;
+}
+
 void vrend_ctx_resource_insert(struct util_hash_table *res_hash,
                                uint32_t res_id,
                                struct vrend_resource *res)

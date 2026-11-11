@@ -496,6 +496,20 @@ int virgl_renderer_context_get_poll_fd(uint32_t ctx_id)
    return ctx->get_fencing_fd(ctx);
 }
 
+int virgl_renderer_set_limits(const struct virgl_renderer_limits *limits)
+{
+   if (!limits || limits->version != VIRGL_RENDERER_LIMITS_VERSION)
+      return EINVAL;
+
+#ifdef ENABLE_VREND
+   if (state.vrend_initialized) {
+      vrend_renderer_set_limits(limits);
+      return 0;
+   }
+#endif
+   return EINVAL;
+}
+
 void virgl_renderer_force_ctx_0(void)
 {
 #ifdef ENABLE_VREND

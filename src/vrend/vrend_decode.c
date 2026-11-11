@@ -1228,8 +1228,7 @@ static int vrend_decode_create_sub_ctx(struct vrend_context *ctx, const uint32_t
 
    uint32_t ctx_sub_id = get_buf_entry(buf, 1);
 
-   vrend_renderer_create_sub_ctx(ctx, ctx_sub_id);
-   return 0;
+   return vrend_renderer_create_sub_ctx(ctx, ctx_sub_id);
 }
 
 static int vrend_decode_destroy_sub_ctx(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
@@ -1428,8 +1427,7 @@ static int vrend_decode_set_streamout_targets(struct vrend_context *ctx,
    append_bitmask = get_buf_entry(buf, VIRGL_SET_STREAMOUT_TARGETS_APPEND_BITMASK);
    for (i = 0; i < num_handles; i++)
       handles[i] = get_buf_entry(buf, VIRGL_SET_STREAMOUT_TARGETS_H0 + i);
-   vrend_set_streamout_targets(ctx, append_bitmask, num_handles, handles);
-   return 0;
+   return vrend_set_streamout_targets(ctx, append_bitmask, num_handles, handles);
 }
 
 static int vrend_decode_texture_barrier(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)

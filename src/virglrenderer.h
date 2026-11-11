@@ -170,6 +170,35 @@ struct virgl_renderer_callbacks {
 #define VIRGL_RENDERER_USE_GUEST_VRAM (1 << 14)
 
 VIRGL_EXPORT int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
+
+#define VIRGL_RENDERER_LIMITS_VERSION 1
+
+/*
+ * Limits on what the command streams of virgl contexts can make the renderer
+ * hold: for each context, for all contexts together and for one shader. A
+ * command that would go past one fails its context, as a malformed command
+ * does. A limit of 0 is no limit.
+ */
+struct virgl_renderer_limits {
+   int version;
+   /* GL contexts: each context's own and the sub-contexts it creates */
+   uint32_t context_sub_contexts;
+   uint32_t total_sub_contexts;
+   /* objects, with the transform feedback objects kept for streamout targets */
+   uint32_t context_objects;
+   uint32_t total_objects;
+   /* TGSI text of the shaders kept and of those still arriving, and the
+    * tokens a shader is parsed into while it is parsed */
+   uint64_t context_shader_bytes;
+   uint64_t total_shader_bytes;
+   /* one shader: the TGSI text it declares and the tokens it is parsed into */
+   uint32_t shader_text_bytes;
+   uint32_t shader_tokens;
+};
+
+/* For the commands submitted after it, until virgl_renderer_cleanup. */
+VIRGL_EXPORT int virgl_renderer_set_limits(const struct virgl_renderer_limits *limits);
+
 VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
 
 /* we need to give qemu the cursor resource contents */
