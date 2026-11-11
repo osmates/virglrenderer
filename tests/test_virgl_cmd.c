@@ -236,6 +236,118 @@ START_TEST(virgl_test_blit_simple)
 }
 END_TEST
 
+static int create_backed_2d_res(struct virgl_resource *res, int handle,
+                                enum pipe_format format, int w, int h,
+                                unsigned nr_samples)
+{
+   struct virgl_renderer_resource_create_args args = {
+      .handle = handle,
+      .target = PIPE_TEXTURE_2D,
+      .format = format,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+      .width = w,
+      .height = h,
+      .depth = 1,
+      .array_size = 1,
+      .nr_samples = nr_samples,
+   };
+   int ret = virgl_renderer_resource_create(&args, NULL, 0);
+   if (ret)
+      return ret;
+
+   res->handle = handle;
+   res->base.target = args.target;
+   res->base.format = format;
+   res->iovs = malloc(sizeof(struct iovec));
+   res->iovs[0].iov_len = w * h * 4;
+   res->iovs[0].iov_base = calloc(1, res->iovs[0].iov_len);
+   res->niovs = 1;
+   return virgl_renderer_resource_attach_iov(handle, res->iovs, res->niovs);
+}
+
+static void clear_res(struct virgl_context *ctx, struct virgl_resource *res,
+                      uint32_t surf_handle, const union pipe_color_union *color)
+{
+   struct virgl_surface surf;
+   struct pipe_framebuffer_state fb_state;
+
+   memset(&surf, 0, sizeof(surf));
+   surf.base.format = res->base.format;
+   surf.handle = surf_handle;
+   surf.base.texture = &res->base;
+   virgl_encoder_create_surface(ctx, surf.handle, res, &surf.base);
+
+   memset(&fb_state, 0, sizeof(fb_state));
+   fb_state.nr_cbufs = 1;
+   fb_state.cbufs[0] = &surf.base;
+   virgl_encoder_set_framebuffer_state(ctx, &fb_state);
+   virgl_encode_clear(ctx, PIPE_CLEAR_COLOR0, color, 0.0, 0);
+}
+
+static void blit_res(struct virgl_context *ctx, struct virgl_resource *dst,
+                     struct virgl_resource *src, int w, int h)
+{
+   struct pipe_blit_info blit;
+
+   memset(&blit, 0, sizeof(blit));
+   blit.mask = PIPE_MASK_RGBA;
+   blit.dst.format = dst->base.format;
+   blit.dst.box.width = w;
+   blit.dst.box.height = h;
+   blit.dst.box.depth = 1;
+   blit.src.format = src->base.format;
+   blit.src.box.width = w;
+   blit.src.box.height = h;
+   blit.src.box.depth = 1;
+   virgl_encode_blit(ctx, dst, src, &blit);
+}
+
+/* Every texel of a 32-bit color resource without its fourth byte. */
+static void check_res_rgb(struct virgl_context *ctx, struct virgl_resource *res,
+                          int w, int h, uint32_t expected)
+{
+   struct virgl_box box = { .w = w, .h = h, .d = 1 };
+   uint32_t *texels = res->iovs[0].iov_base;
+   int ret;
+
+   ret = virgl_renderer_transfer_read_iov(res->handle, ctx->ctx_id, 0, 0, 0, &box, 0, NULL, 0);
+   ck_assert_int_eq(ret, 0);
+   for (int i = 0; i < w * h; i++)
+      ck_assert_uint_eq(texels[i] & 0x00ffffff, expected & 0x00ffffff);
+}
+
+/* A blit that drops alpha needs a swizzle, which only the blitter's shaders
+ * do, also on an OpenGL ES 3.0 host. */
+START_TEST(virgl_test_blit_shader)
+{
+   struct virgl_context ctx;
+   struct virgl_resource src, dst;
+   union pipe_color_union color = { .f = { 0.0f, 1.0f, 0.0f, 1.0f } };
+   int ret;
+
+   ret = testvirgl_init_ctx_cmdbuf(&ctx, context_flags);
+   ck_assert_int_eq(ret, 0);
+   ret = create_backed_2d_res(&src, 1, PIPE_FORMAT_B8G8R8A8_UNORM, 16, 16, 0);
+   ck_assert_int_eq(ret, 0);
+   ret = create_backed_2d_res(&dst, 2, PIPE_FORMAT_B8G8R8X8_UNORM, 16, 16, 0);
+   ck_assert_int_eq(ret, 0);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, src.handle);
+   virgl_renderer_ctx_attach_resource(ctx.ctx_id, dst.handle);
+
+   clear_res(&ctx, &src, 1, &color);
+   blit_res(&ctx, &dst, &src, 16, 16);
+   ret = testvirgl_ctx_send_cmdbuf(&ctx);
+   ck_assert_int_eq(ret, 0);
+   check_res_rgb(&ctx, &dst, 16, 16, test_green);
+
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, dst.handle);
+   virgl_renderer_ctx_detach_resource(ctx.ctx_id, src.handle);
+   testvirgl_destroy_backed_res(&dst);
+   testvirgl_destroy_backed_res(&src);
+   testvirgl_fini_ctx_cmdbuf(&ctx);
+}
+END_TEST
+
 struct vertex {
    float position[4];
    float color[4];
@@ -1979,6 +2091,7 @@ static Suite *virgl_init_suite(void)
   tc_core = tcase_create("clear");
   tcase_add_test(tc_core, virgl_test_clear);
   tcase_add_test(tc_core, virgl_test_blit_simple);
+  tcase_add_test(tc_core, virgl_test_blit_shader);
   tcase_add_test(tc_core, virgl_test_overlap_obj_id);
   tcase_add_test(tc_core, virgl_test_large_shader);
   tcase_add_test(tc_core, virgl_test_render_simple);

@@ -26,6 +26,7 @@
 /* for when we can't use glBlitFramebuffer */
 
 #include <stdio.h>
+#include <string.h>
 
 #include "util/hash_table.h"
 #include "util/macros.h"
@@ -62,6 +63,7 @@ struct vrend_blitter_ctx {
    virgl_gl_context gl_context;
    bool initialised;
    bool use_gles;
+   bool glsl_es_300_only;
 
    GLuint vaoid;
 
@@ -127,7 +129,19 @@ static GLint blit_shader_build_and_check(GLenum shader_type, const char *buf)
 {
    GLint param;
    GLint id = glCreateShader(shader_type);
-   glShaderSource(id, 1, (const char **)&buf, NULL);
+   const char *version = "#version 310 es\n";
+   const char *sources[2] = { buf, NULL };
+   GLsizei count = 1;
+
+   /* An ES 3.0 host compiles GLSL ES 3.00 only. Without ES 3.1 there are no
+    * multisample or cube map array textures to blit, so the shaders it can
+    * need take nothing from 3.10 but the version line. */
+   if (vrend_blit_ctx.glsl_es_300_only && !strncmp(buf, version, strlen(version))) {
+      sources[0] = "#version 300 es\n";
+      sources[1] = buf + strlen(version);
+      count = 2;
+   }
+   glShaderSource(id, count, sources, NULL);
    glCompileShader(id);
 
    glGetShaderiv(id, GL_COMPILE_STATUS, &param);
@@ -465,6 +479,7 @@ static void vrend_renderer_init_blit_ctx(struct vrend_blitter_ctx *blit_ctx)
    vrend_blit_ctx.blit_programs = _mesa_hash_table_u64_create(NULL);
 
    blit_ctx->use_gles = epoxy_is_desktop_gl() == 0;
+   blit_ctx->glsl_es_300_only = blit_ctx->use_gles && epoxy_gl_version() < 31;
    ctx_params.shared = true;
    ctx_params.compat_ctx = false;
    for (uint32_t i = 0; i < ARRAY_SIZE(gl_versions); i++) {
