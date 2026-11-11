@@ -775,6 +775,24 @@ START_TEST(virgl_test_render_integer_attribute)
 }
 END_TEST
 
+/* A zero-stride integer attribute is one value, read in its own format at the
+ * element's offset, each channel widened with its sign. */
+START_TEST(virgl_test_render_integer_constant)
+{
+   static const uint8_t bytes[16] = {
+      0, 0, 0, 0, 64, 128, 192, 255, 0xc0, 0xff, 0xff, 0xff, 0, 0, 0x7f, 0,
+   };
+
+   check_texel_rgb(draw_integer_attribute(PIPE_FORMAT_R8G8B8A8_UINT, false, 0, 4,
+                                          bytes, sizeof(bytes)),
+                   64, 128, 192);
+   /* -64, -1, 0 and 127 as 16-bit values */
+   check_texel_rgb(draw_integer_attribute(PIPE_FORMAT_R16G16B16A16_SINT, true, 0, 8,
+                                          bytes, sizeof(bytes)),
+                   64, 127, 128);
+}
+END_TEST
+
 static void virgl_test_bind_images_shader(int first_layer, int last_layer, int expected_error)
 {
     struct virgl_context ctx;
@@ -2267,6 +2285,7 @@ static Suite *virgl_init_suite(void)
   tcase_add_test(tc_core, virgl_test_large_shader);
   tcase_add_test(tc_core, virgl_test_render_simple);
   tcase_add_test(tc_core, virgl_test_render_integer_attribute);
+  tcase_add_test(tc_core, virgl_test_render_integer_constant);
   tcase_add_test(tc_core, virgl_test_render_geom_simple);
   tcase_add_test(tc_core, virgl_test_render_xfb);
   tcase_add_test(tc_core, virgl_test_set_viewport_state);

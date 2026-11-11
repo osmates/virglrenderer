@@ -5076,6 +5076,61 @@ static GLenum get_xfb_mode(GLenum mode)
    }
 }
 
+/* A zero-stride integer attribute: one value read in the element's format at
+ * its offset, each channel widened with its sign, set on an integer input. */
+static void vrend_set_integer_attrib_value(GLint loc,
+                                           const struct vrend_vertex_element *ve,
+                                           const struct vrend_resource *res,
+                                           uint32_t buffer_offset)
+{
+   const struct util_format_description *desc = util_format_description(ve->base.src_format);
+   const unsigned size = util_format_get_blocksize(ve->base.src_format);
+   const uint64_t offset = (uint64_t)buffer_offset + ve->base.src_offset;
+   /* room past the block for the eight bytes each channel is read from */
+   uint8_t block[16 + 8] = { 0 };
+   GLuint value[4] = { 0, 0, 0, 1 };
+
+   if (!desc)
+      return;
+
+   /* a value past the buffer reads as zero instead of failing the map */
+   if (size <= 16 && offset + size <= res->base.width0) {
+      const void *data = glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_READ_BIT);
+      if (data) {
+         memcpy(block, data, size);
+         glUnmapBuffer(GL_ARRAY_BUFFER);
+      }
+   }
+
+   GLuint channels[4] = { 0, 0, 0, 0 };
+   for (unsigned c = 0; c < desc->nr_channels && c < 4; c++) {
+      const struct util_format_channel_description *channel = &desc->channel[c];
+      uint64_t bits = 0;
+      if (channel->size == 0 || channel->size > 32 || channel->shift / 8 + 8 > sizeof(block))
+         continue;
+      for (unsigned b = 0; b < 8; b++)
+         bits |= (uint64_t)block[channel->shift / 8 + b] << (8 * b);
+      bits = (bits >> (channel->shift % 8)) & ((1ull << channel->size) - 1);
+      if (channel->type == UTIL_FORMAT_TYPE_SIGNED && (bits >> (channel->size - 1)) & 1)
+         bits |= ~0ull << channel->size;
+      channels[c] = (GLuint)bits;
+   }
+
+   for (unsigned i = 0; i < 4; i++) {
+      if (desc->swizzle[i] <= PIPE_SWIZZLE_W)
+         value[i] = channels[desc->swizzle[i]];
+      else if (desc->swizzle[i] == PIPE_SWIZZLE_0)
+         value[i] = 0;
+      else if (desc->swizzle[i] == PIPE_SWIZZLE_1)
+         value[i] = 1;
+   }
+
+   if (util_format_is_pure_sint(ve->base.src_format))
+      glVertexAttribI4iv(loc, (const GLint *)value);
+   else
+      glVertexAttribI4uiv(loc, value);
+}
+
 static void vrend_draw_bind_vertex_legacy(struct vrend_context *ctx,
                                           struct vrend_vertex_element_array *va)
 {
@@ -5128,7 +5183,10 @@ static void vrend_draw_bind_vertex_legacy(struct vrend_context *ctx,
 
       struct vrend_vertex_buffer *vbo = &ctx->sub->vbo[vbo_index];
 
-      if (vbo->base.stride == 0) {
+      if (vbo->base.stride == 0 && util_format_is_pure_integer(ve->base.src_format)) {
+         vrend_set_integer_attrib_value(loc, ve, res, vbo->base.buffer_offset);
+         disable_bitmask |= (1 << loc);
+      } else if (vbo->base.stride == 0) {
          void *data;
          /* for 0 stride we are kinda screwed */
          data = glMapBufferRange(GL_ARRAY_BUFFER, vbo->base.buffer_offset, ve->nr_chan * sizeof(GLfloat), GL_MAP_READ_BIT);
