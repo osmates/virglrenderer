@@ -304,6 +304,52 @@ START_TEST(private_ptr)
 }
 END_TEST
 
+static bool host_has_multisample_textures(void)
+{
+  uint32_t max_ver, max_size;
+  struct virgl_caps_v1 *caps;
+  bool has;
+
+  /* capability set 1, VIRGL */
+  virgl_renderer_get_cap_set(1, &max_ver, &max_size);
+  caps = calloc(1, max_size);
+  virgl_renderer_fill_caps(1, max_ver, caps);
+  has = caps->bset.texture_multisample;
+  free(caps);
+  return has;
+}
+
+/* A multisample texture asking for more samples than its format has is
+ * refused, where the host's GL would leave it without storage. */
+START_TEST(virgl_test_multisample_sample_count)
+{
+  struct virgl_renderer_resource_create_args args;
+  int ret;
+
+  testvirgl_init_single_ctx_nr();
+  if (!host_has_multisample_textures()) {
+    testvirgl_fini_single_ctx();
+    return;
+  }
+
+  testvirgl_init_simple_2d_resource(&args, 1);
+  args.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+  args.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+  args.nr_samples = 4;
+  ret = virgl_renderer_resource_create(&args, NULL, 0);
+  ck_assert_int_eq(ret, 0);
+  virgl_renderer_resource_unref(1);
+
+  /* more than any OpenGL implementation has */
+  args.handle = 2;
+  args.nr_samples = 64;
+  ret = virgl_renderer_resource_create(&args, NULL, 0);
+  ck_assert_int_eq(ret, EINVAL);
+
+  testvirgl_fini_single_ctx();
+}
+END_TEST
+
 static Suite *virgl_init_suite(void)
 {
   Suite *s;
@@ -315,6 +361,7 @@ static Suite *virgl_init_suite(void)
   tcase_add_loop_test(tc_core, virgl_res_tests, 0, ARRAY_SIZE(testlist));
   tcase_add_loop_test(tc_core, cubemaparray_res_tests, 0, ARRAY_SIZE(cubemaparray_testlist));
   tcase_add_test(tc_core, private_ptr);
+  tcase_add_test(tc_core, virgl_test_multisample_sample_count);
   suite_add_tcase(s, tc_core);
   return s;
 

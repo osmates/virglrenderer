@@ -646,7 +646,8 @@ void vrend_check_texture_storage(struct vrend_format_table *table)
 }
 
 void vrend_check_texture_multisample(struct vrend_format_table *table,
-                                     bool enable_storage)
+                                     bool enable_storage,
+                                     bool query_samples)
 {
    bool is_desktop_gl = epoxy_is_desktop_gl();
    for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++) {
@@ -666,8 +667,15 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
             glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
                                     table[i].internalformat, 32, 32, GL_TRUE);
          }
-         if (glGetError() == GL_NO_ERROR)
+         if (glGetError() == GL_NO_ERROR) {
             table[i].flags |= VIRGL_TEXTURE_CAN_MULTISAMPLE;
+            if (query_samples) {
+               GLint max_samples = 2;
+               glGetInternalformativ(GL_TEXTURE_2D_MULTISAMPLE, table[i].internalformat,
+                                     GL_SAMPLES, 1, &max_samples);
+               table[i].max_samples = glGetError() == GL_NO_ERROR ? max_samples : 2;
+            }
+         }
          glDeleteTextures(1, &tex_id);
       }
    }

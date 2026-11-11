@@ -174,6 +174,8 @@ struct vrend_format_table {
    enum view_class view_class;
    uint32_t bindings;
    uint32_t flags;
+   /* the largest sample count, 0 where the host cannot tell */
+   uint32_t max_samples;
 };
 
 typedef void (*vrend_context_fence_retire)(uint64_t fence_id,
@@ -500,7 +502,8 @@ void vrend_build_format_list_gles(void);
 void vrend_build_emulated_format_list_gles(void);
 void vrend_check_texture_storage(struct vrend_format_table *table);
 void vrend_check_texture_multisample(struct vrend_format_table *table,
-                                     bool enable_storage);
+                                     bool enable_storage,
+                                     bool query_samples);
 
 struct vrend_resource *vrend_renderer_ctx_res_lookup(struct vrend_context *ctx,
                                                      int res_handle);

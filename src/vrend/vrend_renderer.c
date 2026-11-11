@@ -175,6 +175,7 @@ enum features_id
    feat_indep_blend_func,
    feat_indirect_draw,
    feat_indirect_params,
+   feat_internalformat_query,
    feat_khr_debug,
    feat_memory_object,
    feat_memory_object_fd,
@@ -288,6 +289,7 @@ static const  struct {
    FEAT(indep_blend_func, 40, 32,  "GL_ARB_draw_buffers_blend", "GL_OES_draw_buffers_indexed"),
    FEAT(indirect_draw, 40, 31,  "GL_ARB_draw_indirect" ),
    FEAT(indirect_params, 46, UNAVAIL,  "GL_ARB_indirect_parameters" ),
+   FEAT(internalformat_query, 42, 30,  "GL_ARB_internalformat_query" ),
    FEAT(khr_debug, 43, 32,  "GL_KHR_debug" ),
    FEAT(memory_object, UNAVAIL, UNAVAIL, "GL_EXT_memory_object"),
    FEAT(memory_object_fd, UNAVAIL, UNAVAIL, "GL_EXT_memory_object_fd"),
@@ -7771,7 +7773,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
    if (has_feature(feat_multisample)) {
       vrend_check_texture_multisample(tex_conv_table,
-                                      has_feature(feat_storage_multisample));
+                                      has_feature(feat_storage_multisample),
+                                      has_feature(feat_internalformat_query));
    }
 
    /* disable for format testing */
@@ -8151,6 +8154,14 @@ static int check_resource_valid(const struct vrend_renderer_resource_create_args
 
       if (args->target != PIPE_TEXTURE_2D && args->target != PIPE_TEXTURE_2D_ARRAY) {
          snprintf(errmsg, 256, "Multisample textures not 2D (target:%d)", args->target);
+         return -1;
+      }
+      /* The host's GL refuses a larger count without vrend noticing. */
+      if (tex_conv_table[args->format].max_samples &&
+          args->nr_samples > tex_conv_table[args->format].max_samples) {
+         snprintf(errmsg, 256, "Multisample %s textures have at most %u samples (asked %u)",
+                  util_format_name(args->format), tex_conv_table[args->format].max_samples,
+                  args->nr_samples);
          return -1;
       }
       /* multisample can't have miplevels */
