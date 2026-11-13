@@ -1394,6 +1394,10 @@ static void init_multisample_funcs(int gles_ver)
    set_feature(feat_texture_multisample);
    set_feature(feat_storage_multisample);
    set_feature(feat_sample_mask);
+
+   /* ANGLE refuses a framebuffer that renders to texture beside a depth and
+    * stencil that does not, as a guest's multisample or packed one is here. */
+   clear_feature(feat_implicit_msaa);
 #endif
 }
 
@@ -3248,6 +3252,22 @@ static void vrend_hw_set_color_surface(struct vrend_sub_context *sub_ctx, GLuint
    }
 }
 
+/* Each attachment's format and the sample counts of its texture and surface. */
+static void vrend_log_framebuffer_attachments(struct vrend_sub_context *sub_ctx)
+{
+   for (uint32_t i = 0; i < sub_ctx->nr_cbufs; i++) {
+      struct vrend_surface *surf = sub_ctx->surf[i];
+      if (!surf || !surf->texture)
+         continue;
+      virgl_error("  color %u: %s, %u samples in the texture, %u in the surface\n", i,
+                  util_format_name(surf->format), surf->texture->base.nr_samples, surf->nr_samples);
+   }
+   if (sub_ctx->zsurf && sub_ctx->zsurf->texture)
+      virgl_error("  depth and stencil: %s, %u samples in the texture, %u in the surface\n",
+                  util_format_name(sub_ctx->zsurf->format), sub_ctx->zsurf->texture->base.nr_samples,
+                  sub_ctx->zsurf->nr_samples);
+}
+
 static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
 {
    static const GLenum buffers[8] = {
@@ -3410,8 +3430,10 @@ void vrend_set_framebuffer_state(struct vrend_context *ctx,
 
    if (sub_ctx->nr_cbufs > 0 || sub_ctx->zsurf) {
       status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-      if (status != GL_FRAMEBUFFER_COMPLETE)
+      if (status != GL_FRAMEBUFFER_COMPLETE) {
          virgl_error("Failed to complete framebuffer 0x%x %s\n", status, ctx->debug_name);
+         vrend_log_framebuffer_attachments(sub_ctx);
+      }
    }
 
    sub_ctx->shader_dirty = true;
