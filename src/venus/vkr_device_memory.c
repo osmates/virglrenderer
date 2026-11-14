@@ -53,6 +53,34 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
    return true;
 }
 
+/* The driver's memory types that can import the map of a shm resource as
+ * host memory.
+ */
+static VkResult
+vkr_get_host_pointer_props_from_resource(struct vkr_device *dev,
+                                         const struct vkr_resource *res,
+                                         uint32_t *out_mem_type_bits)
+{
+   const VkDeviceSize alignment =
+      dev->physical_device->min_imported_host_pointer_alignment;
+   if (alignment && (uintptr_t)res->u.data % alignment) {
+      vkr_log("res %u is not aligned for host memory import", res->res_id);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   VkMemoryHostPointerPropertiesEXT host_props = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+   };
+   const VkResult ret = dev->GetMemoryHostPointerPropertiesEXT(
+      dev->base.handle.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+      res->u.data, &host_props);
+   if (ret != VK_SUCCESS)
+      return ret;
+
+   *out_mem_type_bits = host_props.memoryTypeBits;
+   return VK_SUCCESS;
+}
+
 #if defined(HAVE_LINUX_UDMABUF_H) && defined(HAVE_MEMFD_CREATE)
 #include <fcntl.h>
 #include <linux/udmabuf.h>
@@ -617,26 +645,30 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
       return;
    }
 
-   if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
+   uint32_t mem_type_bits = 0;
+   if (res->fd_type == VIRGL_RESOURCE_FD_SHM &&
+       dev->physical_device->use_host_memory_import) {
+      args->ret = vkr_get_host_pointer_props_from_resource(dev, res, &mem_type_bits);
+   } else if (res->fd_type == VIRGL_RESOURCE_FD_DMABUF) {
+      static const VkExternalMemoryHandleTypeFlagBits handle_type =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      VkMemoryFdPropertiesKHR mem_fd_props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+         .pNext = NULL,
+         .memoryTypeBits = 0,
+      };
+      vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
+      args->ret = vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd,
+                                               &mem_fd_props);
+      mem_type_bits = mem_fd_props.memoryTypeBits;
+   } else {
       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-      return;
    }
-
-   static const VkExternalMemoryHandleTypeFlagBits handle_type =
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-   VkMemoryFdPropertiesKHR mem_fd_props = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
-      .pNext = NULL,
-      .memoryTypeBits = 0,
-   };
-   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
-   args->ret =
-      vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd, &mem_fd_props);
    if (args->ret != VK_SUCCESS)
       return;
 
-   vkr_physical_device_mem_type_spoof(dev->physical_device, &mem_fd_props.memoryTypeBits);
-   args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
+   vkr_physical_device_mem_type_spoof(dev->physical_device, &mem_type_bits);
+   args->pMemoryResourceProperties->memoryTypeBits = mem_type_bits;
 
    VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
       vkr_find_struct(args->pMemoryResourceProperties->pNext,
