@@ -29,6 +29,7 @@ struct vkr_device_memory {
 
    bool might_export;
 
+   /* the memory type's flags as the guest sees them, or the driver's for shm */
    uint32_t property_flags;
    uint32_t valid_fd_types;
 

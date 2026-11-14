@@ -38,6 +38,8 @@ struct vkr_physical_device {
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    bool mem_type_spoof;
+   /* the driver's own flags of each memory type, before the spoof */
+   VkMemoryPropertyFlags driver_mem_type_flags[VK_MAX_MEMORY_TYPES];
    VkPhysicalDeviceIDProperties id_properties;
    bool is_dma_buf_fd_export_supported;
    bool is_opaque_fd_export_supported;

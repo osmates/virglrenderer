@@ -182,6 +182,11 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
    vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
 
+   for (uint32_t i = 0; i < physical_dev->memory_properties.memoryTypeCount; i++) {
+      physical_dev->driver_mem_type_flags[i] =
+         physical_dev->memory_properties.memoryTypes[i].propertyFlags;
+   }
+
    if (!VKR_DEBUG(NO_MEM_TYPE_SPOOF)) {
       VkPhysicalDeviceMemoryProperties *p = &physical_dev->memory_properties;
       const VkMemoryPropertyFlags flags =

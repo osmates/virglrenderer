@@ -498,13 +498,23 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
+   const uint32_t driver_property_flags =
+      physical_dev->driver_mem_type_flags[alloc_info->memoryTypeIndex];
+
+   /* A host that imports host memory can export nothing but shm, so an export
+    * allocation takes the shm path even where the memory type spoof hides
+    * that the driver's type is host visible.
+    */
+   const bool export_shm = physical_dev->use_host_memory_import && might_export &&
+                           (driver_property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
    VkExportMemoryAllocateInfo local_export_info;
 
-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+   if (((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || export_shm) &&
+       !res_info) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
        * If the client driver is using external memory and requesting dma_buf, without
        * dma_buf fd export support, we must use gbm bo import path instead of forcing
@@ -621,7 +631,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       }
    }
 
-   if (export_info && !shm_imported) {
+   /* the guest's fd handle types count only where the driver exports fds */
+   if (export_info && !shm_imported && physical_dev->KHR_external_memory_fd) {
       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_OPAQUE;
       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
@@ -640,7 +651,10 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    mem->device = dev;
    mem->might_export = might_export;
-   mem->property_flags = property_flags;
+   /* shm memory maps as the driver allocated it, whatever the spoofed type says */
+   mem->property_flags = (valid_fd_types & (1 << VIRGL_RESOURCE_FD_SHM))
+                            ? driver_property_flags
+                            : property_flags;
    mem->valid_fd_types = valid_fd_types;
    mem->udmabuf_fd = udmabuf_fd;
    mem->gbm_bo = gbm_bo;
