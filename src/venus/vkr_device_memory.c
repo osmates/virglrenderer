@@ -81,6 +81,51 @@ vkr_get_host_pointer_props_from_resource(struct vkr_device *dev,
    return VK_SUCCESS;
 }
 
+/* Import the map of a shm resource as host memory, sized up as
+ * vkr_shm_alloc sizes the shm of host visible memory. The memory holds a
+ * reference to the map, so a detach of the resource leaves it mapped.
+ */
+static VkResult
+vkr_get_host_pointer_info_from_resource(struct vkr_device *dev,
+                                        const struct vkr_resource *res,
+                                        const VkImportMemoryResourceInfoMESA *res_info,
+                                        VkMemoryAllocateInfo *alloc_info,
+                                        VkImportMemoryHostPointerInfoEXT *out,
+                                        struct vkr_shm **out_shm)
+{
+   const uint64_t alignment = MAX2(
+      dev->physical_device->min_imported_host_pointer_alignment, (uint64_t)getpagesize());
+   if (!alloc_info->allocationSize || alloc_info->allocationSize > res->size ||
+       align64(alloc_info->allocationSize, alignment) > res->size) {
+      vkr_log("failed to import res %u: allocation size %" PRIu64 " for res size %zu",
+              res->res_id, alloc_info->allocationSize, res->size);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   uint32_t mem_type_bits = 0;
+   const VkResult ret =
+      vkr_get_host_pointer_props_from_resource(dev, res, &mem_type_bits);
+   if (ret != VK_SUCCESS)
+      return ret;
+
+   /* alloc_info->memoryTypeIndex is the driver's index */
+   if (!(mem_type_bits & (1u << alloc_info->memoryTypeIndex))) {
+      vkr_log("host memory import is unsupported for memory type %u",
+              alloc_info->memoryTypeIndex);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   *out = (VkImportMemoryHostPointerInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+      .pNext = res_info->pNext,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+      .pHostPointer = res->u.data,
+   };
+   alloc_info->allocationSize = align64(alloc_info->allocationSize, alignment);
+   *out_shm = vkr_shm_ref(res->shm);
+   return VK_SUCCESS;
+}
+
 #if defined(HAVE_LINUX_UDMABUF_H) && defined(HAVE_MEMFD_CREATE)
 #include <fcntl.h>
 #include <linux/udmabuf.h>
@@ -396,20 +441,43 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       return;
    }
 
-   /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
+   if (physical_dev->mem_type_spoof && mem_type_index > 0)
+      alloc_info->memoryTypeIndex = mem_type_index - 1;
+
+   /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place,
+    * or into VkImportMemoryHostPointerInfoEXT for a shm resource on a host that
+    * imports host memory
+    */
    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
+   VkImportMemoryHostPointerInfoEXT local_host_import;
+   struct vkr_shm *shm = NULL;
    VkImportMemoryResourceInfoMESA *res_info = NULL;
    void *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
    if (prev_of_res_info) {
       res_info = (VkImportMemoryResourceInfoMESA *)vkr_pnext_get_next(prev_of_res_info);
-      if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
-         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-         return;
-      }
+      const struct vkr_resource *res =
+         vkr_context_get_resource(ctx, res_info->resourceId);
+      if (res && res->fd_type == VIRGL_RESOURCE_FD_SHM &&
+          physical_dev->use_host_memory_import) {
+         args->ret = vkr_get_host_pointer_info_from_resource(
+            dev, res, res_info, alloc_info, &local_host_import, &shm);
+         if (args->ret != VK_SUCCESS)
+            return;
 
-      vkr_pnext_set_next(prev_of_res_info, &local_import_info);
+         vkr_pnext_set_next(prev_of_res_info, &local_host_import);
+      } else {
+         if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            return;
+         }
+
+         vkr_pnext_set_next(prev_of_res_info, &local_import_info);
+      }
    }
+
+   /* memory imported from a shm resource is the resource's and is not exported */
+   const bool shm_imported = shm;
 
    VkExportMemoryAllocateInfo *export_info =
       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
@@ -430,15 +498,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
-   if (physical_dev->mem_type_spoof && mem_type_index > 0)
-      alloc_info->memoryTypeIndex = mem_type_index - 1;
 
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
-   struct vkr_shm *shm = NULL;
    VkExportMemoryAllocateInfo local_export_info;
-   VkImportMemoryHostPointerInfoEXT local_host_import;
 
    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
@@ -557,7 +621,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       }
    }
 
-   if (export_info) {
+   if (export_info && !shm_imported) {
       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_OPAQUE;
       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
@@ -738,7 +802,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                                       : VIRGL_RENDERER_MAP_CACHE_WC;
    }
 
-   if (mem->shm) {
+   if (mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_SHM)) {
       if (blob_size > mem->shm->size) {
          vkr_log("mem shm size %zu < blob_size %" PRIu64, mem->shm->size, blob_size);
          return false;

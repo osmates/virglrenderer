@@ -38,7 +38,9 @@ struct vkr_device_memory {
    /* udmabuf backing non-external mappable memory */
    int udmabuf_fd;
 
-   /* shm imported as host memory when the host cannot export an fd */
+   /* shm imported as host memory when the host cannot export an fd: the
+    * memory's own, or the map of the shm resource it was imported from
+    */
    struct vkr_shm *shm;
 
    uint64_t allocation_size;
