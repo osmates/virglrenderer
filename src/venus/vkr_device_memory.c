@@ -7,6 +7,7 @@
 
 #include <math.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "util/anon_file.h"
@@ -302,17 +303,52 @@ vkr_shm_alloc(uint64_t size, uint64_t alignment)
    }
 
    shm->size = aligned_size;
+   atomic_init(&shm->refcount, 1);
    return shm;
 }
 
-static void
-vkr_shm_free(struct vkr_shm *shm)
+/* Map the first size bytes of fd, which the caller keeps. */
+struct vkr_shm *
+vkr_shm_map(int fd, size_t size)
 {
+   struct stat st;
+   if (fstat(fd, &st) || st.st_size < 0 || (uint64_t)st.st_size < size) {
+      vkr_log("shm is smaller than %zu bytes", size);
+      return NULL;
+   }
+
+   struct vkr_shm *shm = calloc(1, sizeof(*shm));
    if (!shm)
+      return NULL;
+
+   shm->ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   if (shm->ptr == MAP_FAILED) {
+      free(shm);
+      return NULL;
+   }
+
+   shm->fd = -1;
+   shm->size = size;
+   atomic_init(&shm->refcount, 1);
+   return shm;
+}
+
+struct vkr_shm *
+vkr_shm_ref(struct vkr_shm *shm)
+{
+   atomic_fetch_add_explicit(&shm->refcount, 1, memory_order_relaxed);
+   return shm;
+}
+
+void
+vkr_shm_unref(struct vkr_shm *shm)
+{
+   if (!shm || atomic_fetch_sub_explicit(&shm->refcount, 1, memory_order_acq_rel) != 1)
       return;
 
    munmap(shm->ptr, shm->size);
-   close(shm->fd);
+   if (shm->fd >= 0)
+      close(shm->fd);
    free(shm);
 }
 
@@ -450,7 +486,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
             args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
          }
          if (args->ret != VK_SUCCESS) {
-            vkr_shm_free(shm);
+            vkr_shm_unref(shm);
             return;
          }
 
@@ -506,7 +542,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          close(local_import_info.fd);
       if (gbm_bo)
          vkr_gbm_bo_destroy(gbm_bo);
-      vkr_shm_free(shm);
+      vkr_shm_unref(shm);
       return;
    }
 
@@ -632,7 +668,7 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
 void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
-   vkr_shm_free(mem->shm);
+   vkr_shm_unref(mem->shm);
    if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
@@ -671,6 +707,11 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    }
 
    if (mem->shm) {
+      if (blob_size > mem->shm->size) {
+         vkr_log("mem shm size %zu < blob_size %" PRIu64, mem->shm->size, blob_size);
+         return false;
+      }
+
       mem->exported = true;
       *out_blob = (struct virgl_context_blob){
          .type = VIRGL_RESOURCE_FD_SHM,

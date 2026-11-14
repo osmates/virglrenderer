@@ -9,11 +9,17 @@
 #include "vkr_common.h"
 
 struct gbm_bo;
-/* POSIX shm imported as host memory, backing memory the guest can map */
+/* POSIX shm mapped into the context: backing imported as host memory for
+ * memory the guest can map, or the map of a shm resource. A resource made
+ * from such memory shares its map, so the pages stay mapped until the last
+ * reference goes.
+ */
 struct vkr_shm {
+   /* -1 when the shm is never exported */
    int fd;
    void *ptr;
    size_t size;
+   atomic_uint refcount;
 };
 
 struct vkr_device_memory {
@@ -53,5 +59,14 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                               uint64_t blob_size,
                               uint32_t blob_flags,
                               struct virgl_context_blob *out_blob);
+
+struct vkr_shm *
+vkr_shm_map(int fd, size_t size);
+
+struct vkr_shm *
+vkr_shm_ref(struct vkr_shm *shm);
+
+void
+vkr_shm_unref(struct vkr_shm *shm);
 
 #endif /* VKR_DEVICE_MEMORY_H */

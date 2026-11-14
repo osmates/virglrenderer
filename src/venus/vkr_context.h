@@ -15,6 +15,8 @@
 
 #include "vkr_cs.h"
 
+struct vkr_shm;
+
 /*
  * When vkr_context_create_resource or vkr_context_import_resource is called, a
  * vkr_resource is created, and is valid until vkr_context_destroy_resource.
@@ -30,6 +32,11 @@ struct vkr_resource {
       /* valid when fd_type is shm */
       uint8_t *data;
    } u;
+
+   /* valid when fd_type is shm: the map data points to, which device memory
+    * may share
+    */
+   struct vkr_shm *shm;
 
    size_t size;
 };

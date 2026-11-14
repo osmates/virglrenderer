@@ -5,7 +5,6 @@
 
 #include "vkr_context.h"
 
-#include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -190,7 +189,7 @@ vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
-      munmap(res->u.data, res->size);
+      vkr_shm_unref(res->shm);
    else if (res->u.fd >= 0)
       close(res->u.fd);
    free(res);
@@ -226,9 +225,13 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
                                      uint64_t blob_size,
                                      enum virgl_resource_fd_type fd_type,
                                      int fd,
-                                     void *mmap_ptr)
+                                     struct vkr_shm *shm)
 {
    assert(!vkr_context_get_resource(ctx, res_id));
+
+   /* a shm resource has a map and no fd */
+   assert((fd_type == VIRGL_RESOURCE_FD_SHM) == !!shm);
+   assert(fd < 0 || !shm);
 
    struct vkr_resource *res = malloc(sizeof(*res));
    if (!res)
@@ -238,10 +241,9 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
    res->fd_type = fd_type;
    res->size = blob_size;
 
-   /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
-   assert(fd < 0 || !mmap_ptr);
-   if (mmap_ptr)
-      res->u.data = mmap_ptr;
+   res->shm = shm;
+   if (shm)
+      res->u.data = shm->ptr;
    else
       res->u.fd = fd;
 
@@ -261,13 +263,13 @@ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
 {
    assert(!vkr_context_get_resource(ctx, res_id));
 
-   void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-   if (mmap_ptr == MAP_FAILED)
+   struct vkr_shm *shm = vkr_shm_map(fd, blob_size);
+   if (!shm)
       return false;
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
-                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
-      munmap(mmap_ptr, blob_size);
+                                             VIRGL_RESOURCE_FD_SHM, -1, shm)) {
+      vkr_shm_unref(shm);
       return false;
    }
 
@@ -293,15 +295,15 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
    if (fd < 0)
       return false;
 
-   void *mmap_ptr = mmap(NULL, alloc_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-   if (mmap_ptr == MAP_FAILED) {
+   struct vkr_shm *shm = vkr_shm_map(fd, alloc_size);
+   if (!shm) {
       close(fd);
       return false;
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, alloc_size,
-                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
-      munmap(mmap_ptr, alloc_size);
+                                             VIRGL_RESOURCE_FD_SHM, -1, shm)) {
+      vkr_shm_unref(shm);
       close(fd);
       return false;
    }
@@ -333,12 +335,19 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
       return false;
 
-   /* If memory might get exported, store a dup'ed fd in vkr_resource for:
+   /* A shm resource shares the memory's map, which stays mapped until both
+    * are gone.
+    *
+    * Otherwise, if memory might get exported, store a dup'ed fd in
+    * vkr_resource for:
     * - vkAllocateMemory for dma_buf import
     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
     */
+   struct vkr_shm *shm = NULL;
    int res_fd = -1;
-   if (mem->might_export) {
+   if (blob.type == VIRGL_RESOURCE_FD_SHM) {
+      shm = vkr_shm_ref(mem->shm);
+   } else if (mem->might_export) {
       res_fd = os_dupfd_cloexec(blob.u.fd);
       if (res_fd < 0) {
          close(blob.u.fd);
@@ -347,7 +356,8 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
-                                             NULL)) {
+                                             shm)) {
+      vkr_shm_unref(shm);
       if (res_fd >= 0)
          close(res_fd);
       close(blob.u.fd);
