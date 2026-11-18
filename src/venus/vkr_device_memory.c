@@ -503,9 +503,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    /* A host that imports host memory can export nothing but shm, so an export
     * allocation takes the shm path even where the memory type spoof hides
-    * that the driver's type is host visible.
+    * that the driver's type is host visible. The struct alone marks the
+    * export: the guest's Venus replaces the handle types an application asked
+    * for with the renderer's, and such a host has none.
     */
-   const bool export_shm = physical_dev->use_host_memory_import && might_export &&
+   const bool export_shm = physical_dev->use_host_memory_import && export_info &&
                            (driver_property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 
    uint32_t valid_fd_types = 0;
